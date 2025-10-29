@@ -1,0 +1,22 @@
+# venv & caches
+.venv/
+__pycache__/
+*.pyc
+
+# local env
+.env
+.env.local
+
+# local data & generated artifacts
+data/
+rag_jsonl/
+index_artifacts/
+
+# editors/OS
+.DS_Store
+.idea/
+*.code-workspace
+
+# VS Code (keep launch.json if you like)
+.vscode/*
+!.vscode/launch.json
