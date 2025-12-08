@@ -11,10 +11,13 @@ Usage:
   --exclude-allergen nuts
   --exclude-ingredients "chicken, beef, pork, fish, shrimp, salmon, tuna, turkey"
 """
-import os, json, argparse, re
-from typing import List, Dict, Any
+import os, json, argparse, re, io
+import boto3
+import faiss
 from sentence_transformers import SentenceTransformer
 import faiss
+
+### Helper functions
 
 def read_jsonl(path: str):
     with open(path, "r", encoding="utf-8") as f:
@@ -49,14 +52,41 @@ def auto_filters_from_query(q: str):
     return filters
 
 
-def apply_filters(results, max_minutes=None, diet=None, meal=None, exclude_allergen=None, exclude_ingredients=None):
+def apply_filters(
+    results,
+    max_minutes=None,
+    diet=None,
+    meal=None,
+    exclude_allergen=None,
+    exclude_ingredients=None,
+    include_ingredients=None,
+    require_ingredients=None,
+    max_ingredients=None,
+    max_calories=None,
+    min_calories=None,
+    max_sugar_pdv=None,
+    max_sodium_pdv=None,
+    min_protein_pdv=None,
+    max_steps=None,
+    min_servings=None,
+    max_servings=None,
+    cuisine=None,
+    tag=None
+):
     wanted_diet = (diet or "").lower().strip()
     wanted_meal = (meal or "").lower().strip()
+    wanted_cuisine = (cuisine or "").lower().strip()
+    wanted_tag = (tag or "").lower().strip()
     excl_allergen = (exclude_allergen or "").lower().strip()
 
-    excl_ingredients = []
-    if exclude_ingredients:
-        excl_ingredients = [w.strip().lower() for w in exclude_ingredients.split(",") if w.strip()]
+    def csv_to_list(value: str):
+        if not value:
+            return []
+        return [w.strip().lower() for w in value.split(",") if w.strip()]
+
+    excl_ingredients_list = csv_to_list(exclude_ingredients)
+    include_ingredients_list = csv_to_list(include_ingredients)
+    require_ingredients_list = csv_to_list(require_ingredients)
 
     def has_substr(lst, needle):
         if not needle:
@@ -76,8 +106,19 @@ def apply_filters(results, max_minutes=None, diet=None, meal=None, exclude_aller
         allergens = r.get("allergens") or []
         meals = r.get("meals") or []
         ingredients = r.get("ingredients") or []
+        cuisine_val = (r.get("cuisine") or "").lower()
+        tags = [str(t).lower() for t in (r.get("tags") or [])]
+        servings = r.get("servings")
+        steps = r.get("steps") or []
 
-        if (max_minutes is not None) and (isinstance(mins, (int, float))) and (mins > max_minutes):
+        nutrition = r.get("nutrition") or {}
+        calories = nutrition.get("calories")
+        sugar_pdv_val = nutrition.get("sugar_pdv")
+        sodium_pdv_val = nutrition.get("sodium_pdv")
+        protein_pdv_val = nutrition.get("protein_pdv")
+
+        # Filters
+        if (max_minutes is not None) and isinstance(mins, (int, float)) and (mins > max_minutes):
             continue
         if wanted_diet and not has_substr(diets, wanted_diet):
             continue
@@ -85,26 +126,153 @@ def apply_filters(results, max_minutes=None, diet=None, meal=None, exclude_aller
             continue
         if excl_allergen and has_substr(allergens, excl_allergen):
             continue
-        if excl_ingredients and not none_contains(ingredients, excl_ingredients):
+        if excl_ingredients_list and not none_contains(ingredients, excl_ingredients_list):
             continue
+
+        if include_ingredients_list:
+            has_any = any(
+                query_ing in str(ing).lower()
+                for query_ing in include_ingredients_list
+                for ing in ingredients
+            )
+            if not has_any:
+                continue
+
+        if require_ingredients_list:
+            has_all = True
+            for query_ing in require_ingredients_list:
+                if not any(query_ing in str(ing).lower() for ing in ingredients):
+                    has_all = False
+                    break
+            if not has_all:
+                continue
+
+        if max_ingredients is not None:
+            if len(ingredients) > max_ingredients:
+                continue
+
+        if max_calories is not None and calories is not None:
+            if calories > max_calories:
+                continue
+
+        if min_calories is not None and calories is not None:
+            if calories < min_calories:
+                continue
+
+        if max_sugar_pdv is not None and sugar_pdv_val is not None:
+            if sugar_pdv_val > max_sugar_pdv:
+                continue
+
+        if max_sodium_pdv is not None and sodium_pdv_val is not None:
+            if sodium_pdv_val > max_sodium_pdv:
+                continue
+
+        if min_protein_pdv is not None and protein_pdv_val is not None:
+            if protein_pdv_val < min_protein_pdv:
+                continue
+
+        # Complexity (number of steps) and serving filter (min and max serving values)
+
+        if max_steps is not None:
+            num_steps = len(steps) if steps is not None else None
+            if num_steps is not None and num_steps > max_steps:
+                continue
+
+        if min_servings is not None and servings is not None:
+            if servings < min_servings:
+                continue
+
+        if max_servings is not None and servings is not None:
+            if servings > max_servings:
+                continue
+
+        # Cuisine and Tags
+
+        if wanted_cuisine:
+            if wanted_cuisine not in cuisine_val:
+                continue
+
+        if wanted_tag:
+            if wanted_tag not in tags:
+                continue
 
         out.append(r)
     return out
+
+s3 = boto3.client("s3")
+
+def download_index_from_s3(bucket: str, prefix: str, local_dir: str):
+    os.makedirs(local_dir, exist_ok=True)
+    files = ["recipes_chunks.index", "texts.jsonl", "metas.jsonl", "manifest.json"]
+    for name in files:
+        key = f"{prefix.rstrip('/')}/{name}"
+        local_path = os.path.join(local_dir, name)
+        s3.download_file(bucket, key, local_path)
+
+def download_recipes_from_s3(bucket: str, prefix: str, local_path: str):
+    dir_name = os.path.dirname(local_path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+    key = f"{prefix.rstrip('/')}/recipes.jsonl"
+    s3.download_file(bucket, key, local_path)
 
 def main():
     ap = argparse.ArgumentParser(description="Query a FAISS index of recipe chunks")
     ap.add_argument("--index-dir", default="index_artifacts", help="Directory with recipes_chunks.index + sidecars")
     ap.add_argument("--query", required=True, help="Search query")
     ap.add_argument("--top-k", type=int, default=10, help="Number of recipes to return after dedupe")
-    ap.add_argument("--filter-max-minutes", type=int, default=None)
+
+    ap.add_argument("--filter-max-minutes", type=int, default=None, help="e.g., 30")
     ap.add_argument("--filter-diet", type=str, default=None, help="e.g., vegan (substring match allowed)")
     ap.add_argument("--filter-meal", type=str, default=None, help="e.g., dinner / lunch / breakfast")
     ap.add_argument("--exclude-allergen", type=str, default=None, help="e.g., nuts")
     ap.add_argument("--exclude-ingredients", type=str, default=None, help="comma-separated e.g. 'chicken, beef'")
-    ap.add_argument("--show-steps", action="store_true", help="After retrieving, load recipes.jsonl and print full step-by-step instructions")
-    ap.add_argument("--recipes-jsonl", default="rag_jsonl/recipes.jsonl", help="Path to recipes.jsonl (used with --show-steps)")
+    ap.add_argument("--show-steps", action="store_true", 
+                    help="After retrieving, load recipes.jsonl and print full step-by-step instructions")
+    ap.add_argument("--recipes-jsonl", default="rag_jsonl/recipes.jsonl", 
+                    help="Path to recipes.jsonl (used with --show-steps)")
+    ap.add_argument("--include-ingredients", type=str, default=None,
+                    help="Comma-separated ingredients; keep recipes that contain ANY of them")
+    ap.add_argument("--require-ingredients", type=str, default=None,
+                    help="Comma-separated ingredients; keep recipes that contain ALL of them")
+    ap.add_argument("--filter-max-ingredients", type=int, default=None,
+                    help="Max number of ingredients allowed (simplicity filter)")
+    ap.add_argument("--filter-max-calories", type=float, default=None,
+                    help="Max calories per serving")
+    ap.add_argument("--filter-min-calories", type=float, default=None,
+                    help="Min calories per serving")
+    ap.add_argument("--filter-max-sugar-pdv", type=float, default=None,
+                    help="Max %%DV sugar")
+    ap.add_argument("--filter-max-sodium-pdv", type=float, default=None,
+                    help="Max %%DV sodium")
+    ap.add_argument("--filter-min-protein-pdv", type=float, default=None,
+                    help="Min %%DV protein")
+    ap.add_argument("--filter-max-steps", type=int, default=None,
+                    help="Max number of steps")
+    ap.add_argument("--filter-min-servings", type=int, default=None,
+                    help="Min servings")
+    ap.add_argument("--filter-max-servings", type=int, default=None,
+                    help="Max servings")
+    ap.add_argument("--filter-cuisine", type=str, default=None,
+                    help="Required cuisine (substring match, e.g. 'italian')")
+    ap.add_argument("--filter-tag", type=str, default=None,
+                    help="Required tag (e.g. 'kid-friendly', 'bbq')")
+    
+    # S3 related arguments
+    ap.add_argument("--s3-bucket", type=str, default="foodieai-data",
+                help="S3 bucket name to download index files from")
+    ap.add_argument("--s3-prefix", type=str, default="index_artifacts",
+                help="Prefix inside the S3 bucket for index files")
+    ap.add_argument("--s3-recipes-prefix", type=str, default="rag_jsonl",
+                help="S3 prefix where recipes.jsonl is stored")
 
     args = ap.parse_args()
+
+    if args.s3_bucket:
+        download_index_from_s3(args.s3_bucket, args.s3_prefix, args.index_dir)
+
+    if args.show_steps and args.s3_bucket:
+        download_recipes_from_s3(args.s3_bucket, args.s3_recipes_prefix, args.recipes_jsonl)
 
     # Load manifest (to get embed model used to build the index)
     man_path = os.path.join(args.index_dir, "manifest.json")
@@ -123,7 +291,7 @@ def main():
 
     embed_model_name = manifest.get("embed_model", "sentence-transformers/all-MiniLM-L6-v2")
 
-    # Load index + sidecars
+    # Loading index + sidecars
     index_path = os.path.join(args.index_dir, "recipes_chunks.index")
     texts_path = os.path.join(args.index_dir, "texts.jsonl")
     metas_path = os.path.join(args.index_dir, "metas.jsonl")
@@ -148,7 +316,7 @@ def main():
     if len(texts) != len(metas):
         raise SystemExit("texts.jsonl and metas.jsonl length mismatch. Rebuild the index.")
 
-    # Embed the query with the SAME model used at build time
+    # Embedding the query
     model = SentenceTransformer(embed_model_name)
     q = model.encode([args.query], convert_to_numpy=True, normalize_embeddings=True)
     scores, ids = index.search(q, args.top_k * 5)  # over-retrieve, then filter/dedupe
@@ -160,10 +328,10 @@ def main():
             continue
         m = dict(metas[i])
         m["score"] = float(s)
-        m["text"] = texts[i]  # << fixed: texts[i] is already the string
+        m["text"] = texts[i]
         raw.append(m)
 
-    # Apply filters
+    # Applying filters
     filt = apply_filters(
         raw,
         max_minutes=args.filter_max_minutes,
@@ -171,9 +339,22 @@ def main():
         meal=args.filter_meal,
         exclude_allergen=args.exclude_allergen,
         exclude_ingredients=args.exclude_ingredients,
+        include_ingredients=args.include_ingredients,
+        require_ingredients=args.require_ingredients,
+        max_ingredients=args.filter_max_ingredients,
+        max_calories=args.filter_max_calories,
+        min_calories=args.filter_min_calories,
+        max_sugar_pdv=args.filter_max_sugar_pdv,
+        max_sodium_pdv=args.filter_max_sodium_pdv,
+        min_protein_pdv=args.filter_min_protein_pdv,
+        max_steps=args.filter_max_steps,
+        min_servings=args.filter_min_servings,
+        max_servings=args.filter_max_servings,
+        cuisine=args.filter_cuisine,
+        tag=args.filter_tag
     )
 
-    # Dedupe by doc_id, keep highest score
+    # Dedupe by doc_id, keeping highest score
     best = {}
     for r in filt:
         k = r.get("doc_id")
@@ -181,7 +362,7 @@ def main():
             best[k] = r
 
     results = sorted(best.values(), key=lambda x: x["score"], reverse=True)[:args.top_k]
-    # Optional: join back to full steps from recipes.jsonl
+
     id_to_steps = {}
     if args.show_steps and results:
         try:
@@ -205,12 +386,11 @@ def main():
                         steps = meta["steps"]
                     elif isinstance(rec.get("steps"), list):
                         steps = rec["steps"]
-                    # store if we found something
+                    # store if found
                     if doc_id:
                         id_to_steps[doc_id] = steps
         except FileNotFoundError:
             print(f"[warn] recipes.jsonl not found at {args.recipes_jsonl}; cannot show full steps.")
-
 
     if not results:
         print("No results found.")
@@ -228,10 +408,7 @@ def main():
         ]
         print(f"{i:>2}. " + " | ".join(line))
 
-        snippet = (r.get("text") or "")[:260].replace("\n", " ")
-        print(f"    {snippet}...\n")
-
-        # printing the steps in a structured way
+        # print the steps
         if args.show_steps:
             steps = id_to_steps.get(str(r.get("doc_id")))
             if steps:
@@ -239,7 +416,7 @@ def main():
                 for si, s in enumerate(steps, 1):
                     print(f"      {si}. {s}")
             else:
-                print("    (No structured steps found for this recipe)")
+                print("(No structured steps found for this recipe)")
             print()
 
 if __name__ == "__main__":
