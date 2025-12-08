@@ -1,4 +1,7 @@
+import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
 import '../models/user_profile.dart';
 import '../models/meal.dart';
 
@@ -6,6 +9,19 @@ class UserProvider extends ChangeNotifier {
   UserProfile _profile = UserProfile();
 
   UserProfile get profile => _profile;
+
+  // Helper to get the correct base URL
+  String get _baseUrl {
+    if (kIsWeb) {
+      return 'http://localhost:8000/api/v1';
+    }
+    // Android emulator needs 10.0.2.2 to access host localhost
+    if (Platform.isAndroid) {
+      return 'http://10.0.2.2:8000/api/v1';
+    }
+    // iOS simulator and desktop
+    return 'http://localhost:8000/api/v1';
+  }
 
   void updateGender(String gender) {
     _profile.gender = gender;
@@ -37,8 +53,8 @@ class UserProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  void calculateNutrition() {
-    // Require core fields; dietaryPreference and activityLevel can default
+  Future<void> calculateNutrition() async {
+    // Require core fields
     if (_profile.gender == null ||
         _profile.age == null ||
         _profile.height == null ||
@@ -47,67 +63,85 @@ class UserProvider extends ChangeNotifier {
       return;
     }
 
-    // normalize inputs
-    final gender = _profile.gender!.toLowerCase();
-    final age = _profile.age!;
-    final height = _profile.height!;
-    final weight = _profile.weight!;
+    try {
+      final url = Uri.parse('$_baseUrl/nutrition/calculate');
+      final body = {
+        'gender': _profile.gender!.toLowerCase(),
+        'age': _profile.age,
+        'height': _profile.height,
+        'weight': _profile.weight,
+        'activity_level': (_profile.activityLevel ?? 'sedentary').toLowerCase(),
+        'dietary_preference': (_profile.dietaryPreference ?? 'balanced').toLowerCase(),
+      };
 
-    // Calculate BMR using Mifflin-St Jeor Equation
-    double bmr;
-    if (gender == 'male' || gender == 'm') {
-      bmr = 10 * weight + 6.25 * height - 5 * age + 5;
-    } else {
-      // treat anything else as female for the formula fallback
-      bmr = 10 * weight + 6.25 * height - 5 * age - 161;
+      debugPrint('Calling API: $url with body: $body');
+
+      final response = await http.post(
+        url,
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode(body),
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        _profile.dailyCalories = (data['daily_calories'] as num).toDouble();
+        _profile.protein = (data['protein'] as num).toDouble();
+        _profile.carbs = (data['carbs'] as num).toDouble();
+        _profile.fats = (data['fats'] as num).toDouble();
+        
+        notifyListeners();
+        
+        // Also fetch the meal plan once nutrition is calculated
+        await _fetchMealPlan(body);
+        
+      } else {
+        debugPrint('Failed to calculate nutrition: ${response.statusCode}');
+        debugPrint('Response: ${response.body}');
+      }
+    } catch (e) {
+      debugPrint('Error calculating nutrition: $e');
     }
+  }
 
-    // Apply activity multiplier (default to sedentary if missing)
-    final activity = (_profile.activityLevel ?? 'sedentary').toLowerCase();
-    double activityMultiplier;
-    switch (activity) {
-      case 'sedentary':
-        activityMultiplier = 1.2;
-        break;
-      case 'light':
-        activityMultiplier = 1.375;
-        break;
-      case 'moderate':
-        activityMultiplier = 1.55;
-        break;
-      case 'very':
-        activityMultiplier = 1.725;
-        break;
-      case 'extra':
-        activityMultiplier = 1.9;
-        break;
-      default:
-        activityMultiplier = 1.2;
+  Future<void> _fetchMealPlan(Map<String, dynamic> requestBody) async {
+    try {
+      final url = Uri.parse('$_baseUrl/nutrition/meal-plan');
+      
+      final response = await http.post(
+        url,
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode(requestBody),
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        final items = data['items'] as List;
+        
+        _samplePlans = items.map((item) {
+          final mealsList = (item['meals'] as List).map((m) {
+            return Meal(
+              name: m['name'],
+              type: m['type'],
+              calories: (m['calories'] as num).toDouble(), // Changed to double as per model
+              protein: (m['protein'] as num).toDouble(),
+              carbs: (m['carbs'] as num).toDouble(),
+              fats: (m['fats'] as num).toDouble(),
+            );
+          }).toList();
+          
+          return DayMealPlan(
+            day: item['day'],
+            meals: mealsList,
+          );
+        }).toList();
+
+        notifyListeners();
+      } else {
+        debugPrint('Failed to fetch meal plan: ${response.statusCode}');
+      }
+    } catch (e) {
+      debugPrint('Error fetching meal plan: $e');
     }
-
-    _profile.dailyCalories = bmr * activityMultiplier;
-
-    // Calculate macros based on dietary preference (default to balanced)
-    final pref = (_profile.dietaryPreference ?? 'balanced').toLowerCase();
-    switch (pref) {
-      case 'keto':
-        _profile.protein = _profile.dailyCalories! * 0.25 / 4; // 25% protein
-        _profile.carbs = _profile.dailyCalories! * 0.05 / 4; // 5% carbs
-        _profile.fats = _profile.dailyCalories! * 0.70 / 9; // 70% fats
-        break;
-      case 'vegan':
-      case 'vegetarian':
-        _profile.protein = _profile.dailyCalories! * 0.20 / 4; // 20% protein
-        _profile.carbs = _profile.dailyCalories! * 0.55 / 4; // 55% carbs
-        _profile.fats = _profile.dailyCalories! * 0.25 / 9; // 25% fats
-        break;
-      default: // balanced
-        _profile.protein = _profile.dailyCalories! * 0.30 / 4; // 30% protein
-        _profile.carbs = _profile.dailyCalories! * 0.40 / 4; // 40% carbs
-        _profile.fats = _profile.dailyCalories! * 0.30 / 9; // 30% fats
-    }
-
-    notifyListeners();
   }
 
   void reset() {
@@ -115,63 +149,11 @@ class UserProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  // Simple in-memory sample meal plans to use until backend is connected.
   List<DayMealPlan> _samplePlans = [];
 
   List<DayMealPlan> get samplePlans => _samplePlans;
 
   void populateSampleMealPlans() {
-    // Create a simple 7-day plan with placeholder meals.
-    final days = [
-      'Monday',
-      'Tuesday',
-      'Wednesday',
-      'Thursday',
-      'Friday',
-      'Saturday',
-      'Sunday',
-    ];
-
-    _samplePlans = days.map((day) {
-      return DayMealPlan(
-        day: day,
-        meals: [
-          Meal(
-            name: 'Oatmeal with Berries',
-            type: 'Breakfast',
-            calories: 350,
-            protein: 12,
-            carbs: 58,
-            fats: 8,
-          ),
-          Meal(
-            name: 'Grilled Chicken Salad',
-            type: 'Lunch',
-            calories: 450,
-            protein: 35,
-            carbs: 25,
-            fats: 18,
-          ),
-          Meal(
-            name: 'Salmon with Vegetables',
-            type: 'Dinner',
-            calories: 550,
-            protein: 42,
-            carbs: 35,
-            fats: 22,
-          ),
-          Meal(
-            name: 'Greek Yogurt',
-            type: 'Snack',
-            calories: 150,
-            protein: 15,
-            carbs: 12,
-            fats: 4,
-          ),
-        ],
-      );
-    }).toList();
-
-    notifyListeners();
+    // No-op, handled in _fetchMealPlan
   }
 }
