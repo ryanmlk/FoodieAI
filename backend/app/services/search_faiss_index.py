@@ -201,20 +201,89 @@ def apply_filters(
 
 s3 = boto3.client("s3")
 
+s3 = boto3.client("s3")
+
 def download_index_from_s3(bucket: str, prefix: str, local_dir: str):
+    """
+    Download index artifacts from S3 ONLY if they don't already exist locally.
+    Required files: recipes_chunks.index, texts.jsonl, metas.jsonl, manifest.json
+    """
     os.makedirs(local_dir, exist_ok=True)
     files = ["recipes_chunks.index", "texts.jsonl", "metas.jsonl", "manifest.json"]
     for name in files:
         key = f"{prefix.rstrip('/')}/{name}"
         local_path = os.path.join(local_dir, name)
+        if os.path.exists(local_path):
+            continue
         s3.download_file(bucket, key, local_path)
 
 def download_recipes_from_s3(bucket: str, prefix: str, local_path: str):
+    """
+    Download recipes.jsonl from S3 ONLY if it doesn't already exist locally.
+    """
     dir_name = os.path.dirname(local_path)
     if dir_name:
         os.makedirs(dir_name, exist_ok=True)
     key = f"{prefix.rstrip('/')}/recipes.jsonl"
+    if os.path.exists(local_path):
+        return
     s3.download_file(bucket, key, local_path)
+
+def ensure_index_artifacts(args):
+    """
+    Ensure that the FAISS index and its sidecar files exist locally.
+    If any are missing and an S3 bucket is configured, download them.
+    Otherwise, raise a clear error.
+    """
+    required = ["recipes_chunks.index", "texts.jsonl", "metas.jsonl", "manifest.json"]
+    missing = [
+        name for name in required
+        if not os.path.exists(os.path.join(args.index_dir, name))
+    ]
+
+    if not missing:
+        return
+
+    if not args.s3_bucket:
+        raise SystemExit(
+            f"Missing files {missing} in {args.index_dir} and no S3 bucket configured."
+        )
+
+    download_index_from_s3(args.s3_bucket, args.s3_prefix, args.index_dir)
+
+    # Re-check after download
+    still_missing = [
+        name for name in required
+        if not os.path.exists(os.path.join(args.index_dir, name))
+    ]
+    if still_missing:
+        raise SystemExit(
+            f"After S3 download, still missing {still_missing} in {args.index_dir}."
+        )
+
+def ensure_recipes_file(args):
+    """
+    Ensure recipes.jsonl exists locally when --show-steps is requested.
+    If missing and an S3 bucket is configured, download it.
+    """
+    if not args.show_steps:
+        return
+
+    if os.path.exists(args.recipes_jsonl):
+        return
+    
+    if not args.s3_bucket:
+        raise SystemExit(
+            f"recipes.jsonl not found at {args.recipes_jsonl} and no S3 bucket configured."
+        )
+
+    download_recipes_from_s3(args.s3_bucket, args.s3_recipes_prefix, args.recipes_jsonl)
+
+    if not os.path.exists(args.recipes_jsonl):
+        raise SystemExit(
+            f"After S3 download, recipes.jsonl still not found at {args.recipes_jsonl}."
+        )
+
 
 def main():
     ap = argparse.ArgumentParser(description="Query a FAISS index of recipe chunks")
@@ -268,16 +337,11 @@ def main():
 
     args = ap.parse_args()
 
-    if args.s3_bucket:
-        download_index_from_s3(args.s3_bucket, args.s3_prefix, args.index_dir)
+    ensure_index_artifacts(args)
 
-    if args.show_steps and args.s3_bucket:
-        download_recipes_from_s3(args.s3_bucket, args.s3_recipes_prefix, args.recipes_jsonl)
+    ensure_recipes_file(args)
 
-    # Load manifest (to get embed model used to build the index)
     man_path = os.path.join(args.index_dir, "manifest.json")
-    if not os.path.exists(man_path):
-        raise SystemExit(f"manifest.json not found in {args.index_dir}. Build the index first.")
     with open(man_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
 
